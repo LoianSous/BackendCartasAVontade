@@ -1,0 +1,26 @@
+
+backend/
+├─ cmd/
+│  └─ server/
+│     ├─ docs/
+│     │  ├─ docs.go
+│     │  ├─ swagger.json
+│     │  └─ swagger.yaml
+│     ├─ main.go
+│     └─ teste/                
+├─ internal/
+│  ├─ db/
+│  │  └─ db.go                 # conexão/config do banco
+│  ├─ handlers/
+│  │  └─ routes.go             # roteamento e binding de handlers
+│  ├─ models/
+│  │  ├─ requests.go           # DTOs de entrada (payloads)
+│  │  └─ user.go               # entidades (ex.: User)
+│  └─ services/
+│     ├─ auth.go               # regras de autenticação (login, cadastro, refresh)
+│     ├─ email.go              # envio de e-mails (código, confirmação, etc.)
+│     └─ jwt.go                # geração/validação de tokens JWT
+├─ .env                        # variáveis de ambiente
+├─ go.mod
+├─ go.sum
+└─ README
