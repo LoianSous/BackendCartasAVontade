@@ -2,6 +2,8 @@ package handlers
 
 import (
     "bytes"
+    "os"
+    "strings"
     "log"
     "io"
     "fmt"
@@ -12,6 +14,7 @@ import (
     "github.com/gin-gonic/gin"
     "time"
     "backend/internal/middleware"
+    "github.com/supabase-community/storage-go"
 )
 
 func (h *Handler) SetupRoutes(router *gin.Engine) {
@@ -50,6 +53,14 @@ type Handler struct {
 
 func NewHandler(db *sql.DB) *Handler {
     return &Handler{DB: db}
+}
+
+func NewSupabaseStorage() *storage_go.Client {
+    return storage_go.NewClient(
+        os.Getenv("SUPABASE_URL"),
+        os.Getenv("SUPABASE_SERVICE_ROLE_KEY"),
+        nil,
+    )
 }
 
 // RegisterUser godoc
@@ -624,15 +635,107 @@ func (h *Handler) GetLetterById(c *gin.Context) {
     })
 }
 
+func extractFilePath(url string) string {
+    parts := strings.Split(url, "/letter-photos/")
+    if len(parts) == 2 {
+        return parts[1]
+    }
+    return ""
+}
+
+func deleteFromSupabaseStorage(bucket, path string) error {
+    url := fmt.Sprintf(
+        "%s/storage/v1/object/%s/%s",
+        os.Getenv("SUPABASE_URL"),
+        bucket,
+        path,
+    )
+
+    req, err := http.NewRequest(http.MethodDelete, url, nil)
+    if err != nil {
+        return err
+    }
+
+    req.Header.Set("Authorization", "Bearer "+os.Getenv("SUPABASE_SERVICE_ROLE_KEY"))
+
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+        return err
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != 200 && resp.StatusCode != 204 {
+        body, _ := io.ReadAll(resp.Body)
+        return fmt.Errorf(
+            "erro ao deletar arquivo (%d): %s",
+            resp.StatusCode,
+            string(body),
+        )
+    }
+
+    return nil
+}
+
+
 func (h *Handler) DeleteLetter(c *gin.Context) {
-    id := c.Param("id")
+    letterID := c.Param("id")
 
-    // Deletar fotos primeiro
-    _, _ = h.DB.Exec(`DELETE FROM letter_photos WHERE letter_id = $1`, id)
+    // 1️⃣ Buscar URLs das fotos da carta
+    rows, err := h.DB.Query(`
+        SELECT photo_url
+        FROM letter_photos
+        WHERE letter_id = $1
+    `, letterID)
+    if err != nil {
+        c.JSON(500, gin.H{"error": "Erro ao buscar fotos"})
+        return
+    }
+    defer rows.Close()
 
-    // Deletar carta
-    res, err := h.DB.Exec(`DELETE FROM letters WHERE id = $1`, id)
+    var paths []string
 
+    for rows.Next() {
+        var url string
+        if err := rows.Scan(&url); err != nil {
+            c.JSON(500, gin.H{"error": "Erro ao ler fotos"})
+            return
+        }
+
+        path := extractFilePath(url)
+        if path != "" {
+            paths = append(paths, path)
+        }
+    }
+
+    log.Println("🧪 TESTE → Paths encontrados:", paths)
+
+    // 2️⃣ Apagar arquivos do Supabase Storage (SOMENTE os dessa carta)
+    for _, path := range paths {
+        err := deleteFromSupabaseStorage("letter-photos", path)
+        if err != nil {
+            log.Println("❌ Erro ao deletar imagem:", path, err)
+            c.JSON(500, gin.H{"error": "Erro ao deletar imagem do storage"})
+            return
+        }
+
+        log.Println("🧹 Imagem deletada do storage:", path)
+    }
+
+    // 3️⃣ Apagar registros das fotos no banco
+    _, err = h.DB.Exec(
+        `DELETE FROM letter_photos WHERE letter_id = $1`,
+        letterID,
+    )
+    if err != nil {
+        c.JSON(500, gin.H{"error": "Erro ao deletar fotos"})
+        return
+    }
+
+    // 4️⃣ Apagar carta
+    res, err := h.DB.Exec(
+        `DELETE FROM letters WHERE id = $1`,
+        letterID,
+    )
     if err != nil {
         c.JSON(500, gin.H{"error": "Erro ao deletar carta"})
         return
@@ -644,7 +747,9 @@ func (h *Handler) DeleteLetter(c *gin.Context) {
         return
     }
 
-    c.JSON(200, gin.H{"message": "Carta deletada com sucesso"})
+    c.JSON(200, gin.H{
+        "message": "Carta e fotos deletadas com sucesso",
+    })
 }
 
 func (h *Handler) GetProfile(c *gin.Context) {
