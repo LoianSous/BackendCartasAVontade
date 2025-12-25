@@ -52,3 +52,8 @@ type CreateLetterPhotoRequest struct {
     LetterID int    `json:"letter_id" binding:"required"`
     PhotoURL string `json:"photo_url" binding:"required"`
 }
+
+type ConfirmEmailCodeRequest struct {
+    Email string `json:"email" binding:"required,email"`
+    Code  string `json:"code" binding:"required"`
+}

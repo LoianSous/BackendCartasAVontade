@@ -1,6 +1,7 @@
 package handlers
 
 import (
+    "encoding/json"
     "bytes"
     "os"
     "strings"
@@ -22,7 +23,8 @@ func (h *Handler) SetupRoutes(router *gin.Engine) {
     // ---------------------------
     // ROTAS PÚBLICAS (sem token)
     // ---------------------------
-    router.POST("/register", h.Register)
+    router.POST("/register/request", h.RegisterRequest)
+    router.POST("/register/confirm", h.RegisterConfirm)
     router.POST("/login", h.Login)
     router.POST("/recover-request", h.RecoverRequest)
     router.POST("/recover-verify", h.RecoverVerify)
@@ -74,31 +76,179 @@ func NewSupabaseStorage() *storage_go.Client {
 // @Failure 400 {object} map[string]string
 // @Failure 500 {object} map[string]string
 // @Router /register [post]
-func (h *Handler) Register(c *gin.Context) {
+func (h *Handler) RegisterRequest(c *gin.Context) {
     var req models.RegisterRequest
 
     if err := c.ShouldBindJSON(&req); err != nil {
-        c.JSON(http.StatusBadRequest, gin.H{"error": "JSON inválido"})
+        c.JSON(400, gin.H{"error": "Dados inválidos"})
         return
     }
 
-    hash, err := services.HashPassword(req.Password)
+    var exists bool
+    if err := h.DB.QueryRow(
+        `SELECT EXISTS(SELECT 1 FROM users WHERE email=$1)`,
+        req.Email,
+    ).Scan(&exists); err != nil {
+        c.JSON(500, gin.H{"error": "Erro ao verificar email"})
+        return
+    }
+
+    if exists {
+        c.JSON(400, gin.H{"error": "Email já cadastrado"})
+        return
+    }
+
+    passwordHash, err := services.HashPassword(req.Password)
     if err != nil {
-        c.JSON(500, gin.H{"error": "Erro ao gerar hash"})
+        c.JSON(500, gin.H{"error": "Erro ao gerar senha"})
         return
     }
 
-    query := `INSERT INTO users (name, username, email, password_hash, created_at, updated_at) VALUES ($1, $2, $3, $4, NOW(), NOW())`
-    _, err = h.DB.Exec(query, req.Name, req.Username, req.Email, hash)
+    payload, err := json.Marshal(gin.H{
+        "name": req.Name,
+        "username": req.Username,
+        "password_hash": passwordHash,
+    })
+    if err != nil {
+        c.JSON(500, gin.H{"error": "Erro ao preparar dados"})
+        return
+    }
+
+    code := services.GenerateCode()
+
+    _, err = h.DB.Exec(`
+        INSERT INTO email_verification_codes (email, code, payload, expires_at)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (email)
+        DO UPDATE SET
+            code=$2,
+            payload=$3,
+            expires_at=$4,
+            used=false,
+            created_at=now()
+    `, req.Email, code, payload, time.Now().Add(10*time.Minute))
 
     if err != nil {
-        fmt.Println("ERRO NO INSERT:", err)
-        c.JSON(500, gin.H{"error": "Erro ao salvar usuário"})
+        fmt.Println("DB ERROR:", err)
+        c.JSON(500, gin.H{"error": "Erro ao gerar código"})
         return
     }
 
-    c.JSON(201, gin.H{"message": "Usuário registrado"})
+    if err := services.SendEmail(req.Email, code); err != nil {
+        fmt.Println("SMTP ERROR:", err)
+        c.JSON(500, gin.H{"error": "Erro ao enviar email"})
+        return
+    }
+
+    c.JSON(200, gin.H{"message": "Código enviado"})
 }
+
+func (h *Handler) RegisterConfirm(c *gin.Context) {
+    var req models.ConfirmEmailCodeRequest
+
+    if err := c.ShouldBindJSON(&req); err != nil {
+        log.Println("BIND ERROR:", err)
+        c.JSON(400, gin.H{"error": "Dados inválidos"})
+        return
+    }
+
+    // 🔥 NORMALIZAÇÃO (muito importante)
+    req.Email = strings.TrimSpace(strings.ToLower(req.Email))
+    req.Code = strings.TrimSpace(req.Code)
+
+    log.Println("CONFIRM REQUEST → email:", req.Email, " code:", req.Code)
+
+    tx, err := h.DB.Begin()
+    if err != nil {
+        log.Println("TX BEGIN ERROR:", err)
+        c.JSON(500, gin.H{"error": "Erro interno"})
+        return
+    }
+    defer tx.Rollback()
+
+    var payload []byte
+    var expiresAt time.Time
+    var used bool
+
+    err = tx.QueryRow(`
+        SELECT payload, expires_at, used
+        FROM email_verification_codes
+        WHERE email=$1 AND code=$2
+        FOR UPDATE
+    `, req.Email, req.Code).Scan(&payload, &expiresAt, &used)
+
+    if err == sql.ErrNoRows {
+        log.Println("ERROR: no matching code for email/code")
+        c.JSON(400, gin.H{"error": "Código inválido ou expirado"})
+        return
+    } else if err != nil {
+        log.Println("DB ERROR:", err)
+        c.JSON(500, gin.H{"error": "Erro interno"})
+        return
+    }
+
+    log.Println("DB RECORD → used:", used, " expires_at:", expiresAt, " now:", time.Now())
+
+    if used {
+        log.Println("ERROR: code already used")
+        c.JSON(400, gin.H{"error": "Código já utilizado"})
+        return
+    }
+
+    if time.Now().After(expiresAt) {
+        log.Println("ERROR: code expired")
+        c.JSON(400, gin.H{"error": "Código expirado"})
+        return
+    }
+
+    var data map[string]string
+    if err := json.Unmarshal(payload, &data); err != nil {
+        log.Println("PAYLOAD UNMARSHAL ERROR:", err)
+        c.JSON(500, gin.H{"error": "Erro interno"})
+        return
+    }
+
+    log.Println("PAYLOAD DATA:", data)
+
+    _, err = tx.Exec(`
+        INSERT INTO users (name, username, email, password_hash)
+        VALUES ($1, $2, $3, $4)
+    `,
+        data["name"],
+        data["username"],
+        req.Email,
+        data["password_hash"],
+    )
+
+    if err != nil {
+        log.Println("USER INSERT ERROR:", err)
+        c.JSON(409, gin.H{"error": "Usuário já existe"})
+        return
+    }
+
+    _, err = tx.Exec(`
+        UPDATE email_verification_codes
+        SET used=true
+        WHERE email=$1 AND code=$2
+    `, req.Email, req.Code)
+
+    if err != nil {
+        log.Println("UPDATE CODE ERROR:", err)
+        c.JSON(500, gin.H{"error": "Erro ao confirmar código"})
+        return
+    }
+
+    if err := tx.Commit(); err != nil {
+        log.Println("TX COMMIT ERROR:", err)
+        c.JSON(500, gin.H{"error": "Erro interno"})
+        return
+    }
+
+    log.Println("SUCCESS: user created and code confirmed →", req.Email)
+
+    c.JSON(200, gin.H{"message": "Conta criada com sucesso"})
+}
+
 
 // LoginUser godoc
 // @Summary Faz login do usuário
