@@ -98,6 +98,21 @@ func (h *Handler) RegisterRequest(c *gin.Context) {
         return
     }
 
+    // Verificar se username já existe
+    if err := h.DB.QueryRow(
+        `SELECT EXISTS(SELECT 1 FROM users WHERE username=$1)`,
+        req.Username,
+    ).Scan(&exists); err != nil {
+        c.JSON(500, gin.H{"error": "Erro ao verificar usuário"})
+        return
+    }
+
+    if exists {
+        c.JSON(400, gin.H{"error": "Nome de usuário já está em uso"})
+        return
+    }
+
+
     passwordHash, err := services.HashPassword(req.Password)
     if err != nil {
         c.JSON(500, gin.H{"error": "Erro ao gerar senha"})
